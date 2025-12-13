@@ -11,6 +11,8 @@ ClientInfo clients[MAX_CLIENTS];
 VehicleInfo vehicles[MAX_VEHICLES];
 ServiceInfo services[MAX_SERVICES];
 int vehicle_telemetry_fds[MAX_VEHICLES];
+int telemetry_pipe_read = -1;
+int telemetry_pipe_write = -1;
 int num_clients = 0;
 int num_vehicles = 0;
 int num_services = 0;
@@ -50,6 +52,16 @@ int main(int argc, char *argv[]) {
 
     // Tratamento de Sinais (CTRL+C)
     signal(SIGINT, cleanup_and_exit);
+
+    // Criar pipe anónimo para telemetria
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) {
+        perror("[CONTROLADOR] Erro ao criar pipe de telemetria");
+        exit(1);
+    }
+    telemetry_pipe_read = pipe_fds[0];
+    telemetry_pipe_write = pipe_fds[1];
+    fcntl(telemetry_pipe_read, F_SETFL, O_NONBLOCK);
 
     // Validar ambiente
     if(getenv("NVEICULOS") == NULL) {
@@ -263,6 +275,15 @@ void handle_ride_request(ClientMessage msg) {
         sprintf(err_msg, "Hora inválida. Deve ser no futuro. (Hora atual é %d)", simulated_time);
         send_response(msg.client_pid, 0, err_msg);
         return;
+    }
+    
+    // Verificar se o cliente já tem uma viagem agendada ou em progresso
+    for (int i = 0; i < num_services; i++) {
+        if (services[i].client_pid == msg.client_pid && 
+            (services[i].status == STATUS_SCHEDULED || services[i].status == STATUS_IN_PROGRESS)) {
+            send_response(msg.client_pid, 0, "Já tem uma viagem agendada ou em progresso. Aguarde a conclusão.");
+            return;
+        }
     }
     
     // Criar serviço
@@ -485,10 +506,22 @@ void launch_vehicle(int service_index) {
     // Criar named pipe para telemetria do veículo
     char pipe_vehicle_path[50];
     sprintf(pipe_vehicle_path, PIPE_VEHICLE_FMT, srv->vehicle_id);
-    if (mkfifo(pipe_vehicle_path, 0666) == -1 && errno != EEXIST) {
+    
+    // Remover pipe antigo se existir
+    unlink(pipe_vehicle_path);
+    
+    // Criar novo pipe
+    if (mkfifo(pipe_vehicle_path, 0666) == -1) {
         perror("[CONTROLADOR] Erro ao criar pipe de veículo");
         return;
     }
+    
+    // Resetar o FD da telemetria para este veículo
+    int vehicle_idx = srv->vehicle_id - 1;
+    if (vehicle_telemetry_fds[vehicle_idx] != -1) {
+        close(vehicle_telemetry_fds[vehicle_idx]);
+    }
+    vehicle_telemetry_fds[vehicle_idx] = -1;
     
     pid_t pid = fork();
     if (pid == -1) {
@@ -528,59 +561,47 @@ void launch_vehicle(int service_index) {
 
 // --- Thread de Telemetria de Veículos ---
 void* vehicle_telemetry_thread(void* arg) {
-    fd_set read_fds;
-    struct timeval tv;
-    int max_fd;
     char buffer[BUFFER_SIZE];
     
-    // Abrir todos os pipes de telemetria antecipadamente
-    for (int i = 0; i < MAX_VEHICLES; i++) {
-        char pipe_path[50];
-        sprintf(pipe_path, PIPE_VEHICLE_FMT, i + 1);
-        vehicle_telemetry_fds[i] = open(pipe_path, O_RDONLY | O_NONBLOCK);
-    }
-    
     while (keep_running) {
-        FD_ZERO(&read_fds);
-        max_fd = -1;
-        
-        pthread_mutex_lock(&data_mutex);
-        for (int i = 0; i < num_vehicles; i++) {
+        // Tentar abrir e ler de cada pipe de veículo (dinâmico)
+        int has_data = 0;
+        for (int i = 0; i < MAX_VEHICLES; i++) {
+            int vehicle_num = i + 1;
+            char pipe_path[50];
+            sprintf(pipe_path, PIPE_VEHICLE_FMT, vehicle_num);
+            
+            // Se o FD ainda não foi aberto, tentar abrir
+            if (vehicle_telemetry_fds[i] == -1) {
+                vehicle_telemetry_fds[i] = open(pipe_path, O_RDONLY | O_NONBLOCK);
+            }
+            
+            // Se o FD está aberto, tentar ler
             if (vehicle_telemetry_fds[i] != -1) {
-                FD_SET(vehicle_telemetry_fds[i], &read_fds);
-                if (vehicle_telemetry_fds[i] > max_fd) {
-                    max_fd = vehicle_telemetry_fds[i];
-                }
-            }
-        }
-        pthread_mutex_unlock(&data_mutex);
-        
-        if (max_fd == -1) {
-            sleep(1);
-            continue;
-        }
-        
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
-        
-        if (activity > 0) {
-            for (int i = 0; i < MAX_VEHICLES; i++) {
-                if (vehicle_telemetry_fds[i] != -1 && FD_ISSET(vehicle_telemetry_fds[i], &read_fds)) {
-                    ssize_t n = read(vehicle_telemetry_fds[i], buffer, sizeof(buffer) - 1);
-                    if (n > 0) {
-                        buffer[n] = '\0';
-                        
-                        // Processar cada linha
-                        char* line = strtok(buffer, "\n");
-                        while (line != NULL) {
-                            process_vehicle_telemetry(line, vehicles[i].id);
-                            line = strtok(NULL, "\n");
+                ssize_t n = read(vehicle_telemetry_fds[i], buffer, sizeof(buffer) - 1);
+                if (n > 0) {
+                    has_data = 1;
+                    buffer[n] = '\0';
+                    
+                    // Processar cada linha
+                    char* line = strtok(buffer, "\n");
+                    while (line != NULL) {
+                        if (strlen(line) > 0) {
+                            process_vehicle_telemetry(line, vehicle_num);
                         }
+                        line = strtok(NULL, "\n");
                     }
+                } else if (n < 0 && errno == EBADF) {
+                    // Pipe foi fechado
+                    close(vehicle_telemetry_fds[i]);
+                    vehicle_telemetry_fds[i] = -1;
                 }
             }
+        }
+        
+        // Se não houver dados, aguardar um pouco
+        if (!has_data) {
+            usleep(50000);  // 50ms
         }
     }
     
@@ -588,7 +609,12 @@ void* vehicle_telemetry_thread(void* arg) {
     for (int i = 0; i < MAX_VEHICLES; i++) {
         if (vehicle_telemetry_fds[i] != -1) {
             close(vehicle_telemetry_fds[i]);
+            vehicle_telemetry_fds[i] = -1;
         }
+    }
+    
+    if (telemetry_pipe_read != -1) {
+        close(telemetry_pipe_read);
     }
     
     return NULL;
@@ -609,10 +635,18 @@ void process_vehicle_telemetry(char* line, int vehicle_id) {
     }
     
     pthread_mutex_lock(&data_mutex);
-    
-    // TODO - ATUALIZAR O CLIENTE DO QUE SE PASSOU E IMPRIMIR NA CONSOLA DO CONTROLADOR
 
-    if (strcmp(type, "PROGRESS") == 0) {
+    if (strcmp(type, "TRIP_STARTED") == 0) {
+        // Enviar mensagem ao cliente que a viagem iniciou
+        for (int s = 0; s < num_services; s++) {
+            if (services[s].id == service_id && services[s].status == STATUS_IN_PROGRESS) {
+                send_response(services[s].client_pid, 1, "Viagem iniciada!");
+                printf("\r\033[K[CONTROLADOR] Viagem iniciada!\nCMD> ");
+                fflush(stdout);
+                break;
+            }
+        }
+    } else if (strcmp(type, "PROGRESS") == 0) {
         int percent;
         if (sscanf(line, "%*[^|]|%*d|%*d|%d", &percent) == 1) {
             for (int i = 0; i < num_vehicles; i++) {
@@ -627,21 +661,20 @@ void process_vehicle_telemetry(char* line, int vehicle_id) {
         if (sscanf(line, "%*[^|]|%*d|%*d|%lf", &km) == 1) {
             for (int i = 0; i < num_vehicles; i++) {
                 if (vehicles[i].id == vid) {
-                    vehicles[i].total_km += km - vehicles[i].total_km;
-                    //!DEBUG 
-                    //TODO
+                    double prev_km = vehicles[i].total_km;
+                    vehicles[i].total_km = km;
+                    
                     printf("\r\033[K[DEBUG] Veículo %d percorreu mais %.1f km. Total: %.1f km\nCMD> ",
-                           vid, km - vehicles[i].total_km, vehicles[i].total_km);
+                           vid, km - prev_km, km);
                     fflush(stdout);
                     break;
                 }
             }
         }
     } else if (strcmp(type, "COMPLETED") == 0 || strcmp(type, "CANCELLED") == 0) {
-        double trip_km = 0.0;
         
         for (int i = 0; i < num_services; i++) {
-            if (services[i].vehicle_id == vehicle_id) {
+            if (services[i].id == service_id) {
                 services[i].status = (strcmp(type, "CANCELLED") == 0) ? STATUS_CANCELLED : STATUS_COMPLETED;
                 
                 for (int c = 0; c < num_clients; c++) {
@@ -650,7 +683,7 @@ void process_vehicle_telemetry(char* line, int vehicle_id) {
 
                         char msg[BUFFER_SIZE];
                         if (strcmp(type, "COMPLETED") == 0) {
-                            sprintf(msg, "Viagem concluída! Percorridos %.1f km.", trip_km);
+                            sprintf(msg, "Viagem concluída! Percorridos %.1f km.", services[i].distance_km);
                         } else {
                             sprintf(msg, "Viagem cancelada. Serviço ID %d", services[i].id);
                         }
@@ -669,6 +702,13 @@ void process_vehicle_telemetry(char* line, int vehicle_id) {
                 vehicles[i].progress_percent = 0;
                 vehicles[i].service_id = -1;
                 vehicles[i].process_pid = 0;
+                vehicles[i].total_km = 0.0;  // Resetar KM para a próxima viagem
+                
+                // Fechar o FD da telemetria
+                if (vehicle_telemetry_fds[i] != -1) {
+                    close(vehicle_telemetry_fds[i]);
+                    vehicle_telemetry_fds[i] = -1;
+                }
                 
                 // Remover pipe
                 char pipe_path[50];
@@ -902,6 +942,15 @@ void cleanup_and_exit(int signal) {
     keep_running = 0;
 
     unlink(PIPE_SERVER);
+    
+    // Fechar pipes de telemetria
+    if (telemetry_pipe_read != -1) {
+        close(telemetry_pipe_read);
+    }
+    if (telemetry_pipe_write != -1) {
+        close(telemetry_pipe_write);
+    }
+    
     broadcast_shutdown();
     printf("[CONTROLADOR] Encerrado.\n");
     exit(0);

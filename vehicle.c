@@ -61,11 +61,6 @@ int main(int argc, char *argv[]) {
     sprintf(start_msg, "TRIP_STARTED|%d|%d", vehicle_id, service_id);
     send_telemetry(start_msg);
     
-    //TODO REMOVER , é o controladro que tem de dizer isto
-    printf("\r\033[K[VEICULO %d] Viagem iniciada!\nCMD> ", vehicle_id);
-    fflush(stdout);
-    sleep(1);
-    
     if (!running) {
         send_telemetry("CANCELLED");
         close_telemetry_pipe();
@@ -93,7 +88,7 @@ int main(int argc, char *argv[]) {
         // Enviar quilómetros percorridos
         double km_done = (percent / 100.0) * distancia_km;
         char km_msg[256];
-        //TODO
+        
         sprintf(km_msg, "DISTANCE|%d|%d|%.2f", vehicle_id, service_id, km_done);
         send_telemetry(km_msg);
     }
