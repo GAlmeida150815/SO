@@ -6,7 +6,7 @@
 #define MAX_VEHICLES 10
 #define MAX_SERVICES 50
 
-// --- Variáveis Globais ---
+// --- Variáveis Globais ----
 ClientInfo clients[MAX_CLIENTS];
 VehicleInfo vehicles[MAX_VEHICLES];
 ServiceInfo services[MAX_SERVICES];
